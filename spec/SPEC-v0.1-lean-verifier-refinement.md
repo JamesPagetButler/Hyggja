@@ -26,7 +26,7 @@ It does **not** specify model architecture, training hyperparameters, or which b
 model to baseline (that's P2, a separate decision once a harness exists to measure
 against).
 
-## 1. Statement census (prerequisite, cheap, no compute gate)
+## 1. Statement census (prerequisite — mostly gate-free, one step isn't)
 
 Before sizing anything: inventory existing Lean statements across federation repos
 with a tracking issue, so the harness isn't built against a guess.
@@ -48,10 +48,14 @@ closed_by (lean-prover | human | unknown), proof_length_lines,
 is_public_repo (bool — for §1.1's contamination split)
 ```
 
-This is read-only, I/O-bound work — no `boxrun` gate applies (per `boxrun` skill §1:
-"pure I/O or git work with no CPU-bound math" is explicitly out of scope for that
-wrapper). The axiom-audit confirmation pass is also read-only against already-compiled
-`.olean`s and needs no gate.
+**Gate split (corrected per §I4 re-read):** the `grep` + git/issue cross-reference pass
+is read-only, I/O-bound work — no `boxrun` gate applies (per `boxrun` skill §1: "pure
+I/O or git work with no CPU-bound math" is explicitly out of scope for that wrapper).
+**The axiom-audit confirmation pass is not** — running `LeanAxiomAudit.lean` loads
+Mathlib, which is compute, so it goes through `boxrun` like any other Lean check. It
+needs no **run-go** (no deming/architect/beekeeper three-gate process — it's a
+read-only audit of already-compiled `.olean`s, not a resourced sampling or training
+run), just the mandatory `boxrun` wrapper itself.
 
 ### 1.1 Frozen train/eval split (prerequisite to any harness run — fixes B3)
 
@@ -64,6 +68,10 @@ Before any harvest (§3) or sampling (§2, §4) touches the census output:
    *unrefined* candidate/baseline model passes at P2, before any §4 mechanism runs.
    This is axis 2 (retention) of theory §6's gate; it is produced by running the P1
    harness (§2) once, unrefined, and is not itself part of the held-out eval set.
+   **`retention_tolerance` (theory §6 axis 2's "regression beyond a stated tolerance")
+   is chosen and hashed together with this set, at the same time, before any training
+   row exists** — fixed per §I4 re-read: a tolerance picked after seeing results could
+   be loosened to pass, defeating the gate's purpose.
 3. **Exclusion enforcement:** no statement in the held-out eval set may enter §3/§4
    training data, enforced by **both** `statement_id` and the §2.2 type fingerprint —
    a renamed/restated copy of a held-out statement must not leak into training through
