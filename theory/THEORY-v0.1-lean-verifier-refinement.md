@@ -5,6 +5,11 @@
 formality model, `inter/ontology/ontology.yaml`). No run has occurred. Nothing here is
 claimed as validated; this document exists to get the *design* reviewed before any
 evidence-moving work starts.
+**Revision (2026-11-25):** addresses qbp-architecture's first §I4 read on this PR
+(Hyggja#7 `issuecomment-7168549676`, CHANGES REQUESTED): B1 (verifier soundness, new
+§2.1), B2 (two-axis gate correction + citation fix, §6), B3 (frozen train/eval split,
+new spec §1.1), plus the should-fix items (variant equivalence, notation, failure
+class, compile-memory cost, data-starvation caveat).
 **Reviewers:** @qbp-architecture (sign-off required)
 
 ---
@@ -36,11 +41,46 @@ this federation, not because it's the most interesting ML problem in the abstrac
   generation step is needed.
 - **We already have a verifier.** Lean's own kernel check (`lake build` / `lake env
   lean`) is wired into the federation via the `lean` skill and `boxrun`. Pass/fail is
-  not a judgment call.
+  a mechanical predicate — but, for untrusted model-generated text, it is a more
+  specific predicate than "the build exited zero." See §2.1.
 - **We already have a reference agent.** The `lean-prover` builder agent (QBP#480,
   federation-canonical promotion tracked on inter#319) produces Lean proofs today,
   independent of this effort, as a byproduct of other sprints. Its successes and
   failures are free signal.
+
+### 2.1 What "pass" must mean (verifier soundness — fixes B1)
+
+A compile success from `lake build` / `lake env lean` is **not**, by itself, a
+proof-soundness verdict for untrusted model-generated text. The federation already has
+hard, repeated evidence of this: QBP#824/#829 built a real, out-of-process axiom audit
+(`scripts/LeanAxiomAudit.lean`) specifically because a plain build can be satisfied by
+`sorry` (only a warning), `native_decide`, `axiom`, or a changed statement (restating
+the theorem, shadowing a name, or adding `macro`/`notation`/`local instance` so the same
+text means something weaker) — and QBP#836 is an **open**, beekeeper-level decision on
+a harder case (S1, "olean substitution"): build-time code (`#eval`, `run_cmd`,
+`run_elab`, `initialize`, an elaborator) can recompile a clean `.olean` over a `sorry`'d
+source, so the *compiled artifact* an out-of-process auditor reads is lying about the
+actual source. QBP#824/#829's own Red Team rounds found a forged PASS for a false
+statement (`theorem bogus : (1 : Nat) = 2 := rfl`) in each of their last two rounds —
+this is a demonstrated failure mode, not a hypothetical one.
+
+This theory's §1 claim — "checked by a real, deterministic verifier" — holds only once
+"pass" means a specific predicate, not "the build exited zero." The predicate (spec §2
+step 2, spec §2.2) requires all three:
+
+1. The elaborated type of the candidate's declaration equals the reference statement's
+   type, compared by fingerprint, not by source text.
+2. The axiom set is a subset of `{propext, Classical.choice, Quot.sound}`, audited by
+   reusing QBP#829's `LeanAxiomAudit.lean` rather than building a second checker.
+3. The candidate is restricted to a proof body with no new commands, checked under
+   QBP#824's subset, and — until QBP#836 resolves the build-time-execution gap — run in
+   a sandbox that cannot write the path an out-of-process auditor reads.
+
+This matters most for §4.2's rejection-sampling/GRPO loop: optimizing a model against
+raw compile success, rather than this predicate, is a search process aimed straight at
+the same gaps QBP#824/#829/#836 are about — reward hacking, not a theoretical edge case.
+It also means the census in spec §1 cannot rely on `grep` for "`sorry`-free" alone,
+since `grep` misses a `sorry` produced by a macro.
 
 ## 3. Relation to prior art (Dr. Zero, arXiv:2601.07055)
 
@@ -52,11 +92,14 @@ Researched 2026-11-24 via a web-fetch agent read of the arXiv abstract/HTML and 
 Dr. Zero is a self-play RL method for web-search question-answering agents
 (Qwen2.5-3B/7B), built around a *proposer* that invents QA pairs and a *solver* that
 attempts them. Its central reusable idea is a **pass-rate-shaped training signal**:
-reward a problem for being solved by *some but not all* of n sampled attempts
-(0 < k < n), and treat k=0 (unsolvable) or k=n (trivial) as uninformative. Its central
-structural weakness, by the paper's own admission, is that it has **no independent
-verifier** — correctness is exact-match against the proposer's own self-generated
-answer, which the paper concedes introduces label noise it cannot fully eliminate.
+reward a problem for being solved by *some but not all* of `n` sampled attempts
+(0 < `p` < `n`, where `p` is the number of passing attempts), and treat `p`=0
+(unsolvable) or `p`=`n` (trivial) as uninformative. (Notation standardized here —
+`n`=samples, `p`=passes — used consistently through the rest of this document and the
+companion spec.) Its central structural weakness, by the paper's own admission, is that
+it has **no independent verifier** — correctness is exact-match against the proposer's
+own self-generated answer, which the paper concedes introduces label noise it cannot
+fully eliminate.
 
 **What we adopt:** the pass-rate-shaped curriculum idea (§4.2 below).
 **What we explicitly do not adopt:** Dr. Zero's proposer mechanism (we don't need to
@@ -85,12 +128,14 @@ least novel, easiest to falsify).
 
 ### 4.2 Pass-rate-filtered self-improvement loop
 
-For a statement not already in the distillation set: sample *k* proof attempts from
-the candidate model, Lean-check each. Keep only statements where 0 < (passing attempts)
-< k — partially solved, neither trivial nor currently out of reach — as the training
-curriculum. Train on the verified-passing rollouts via rejection-sampling SFT, or (if
-the harness in §5 shows it's worth the added complexity) GRPO with a compile-success
-reward.
+For a statement not already in the distillation set: sample `n` proof attempts from
+the candidate model, check each against the §2.1 pass predicate — **not** a bare
+compile. Keep only statements where 0 < `p` < `n` (`p` = attempts satisfying the
+predicate) — partially solved, neither trivial nor currently out of reach — as the
+training curriculum. Train on the passing rollouts via rejection-sampling SFT, or (if
+the harness in §5 shows it's worth the added complexity, **and** §2.1's sandbox gap is
+closed) GRPO with a predicate-success reward — never a raw compile-success reward,
+which is exactly the reward-hacking surface §2.1 names.
 
 This is the part that rhymes with Dr. Zero's solver loop; unlike Dr. Zero we have a
 real correctness signal for every rollout, not an approximate one.
@@ -109,21 +154,36 @@ existing one)
   show each one moves the baseline. If distillation alone saturates the measurable
   gain, there is no mandate to build the harder RL loop.
 - **P4:** out of scope for this document.
+- **Known limitation, not yet a failure:** `lean-prover`'s federation-wide adoption is
+  held (inter#319), so the §4.1 distillation pool may be small at first — the census
+  (spec §1) will show how small. A thin pool is a finding to report at P1/P2, not
+  evidence the mechanism doesn't work.
 
-## 6. Two-axis eval gate (extends the qbp-architecture weight-space ruling)
+## 6. Two-axis eval gate (extends the qbp-architecture weight-space ruling) — corrected per B2
 
-Per [[qbp-architecture-weight-space-ruling]], a candidate artifact is auditable only
-with an edit-plus-eval-record, gated on two axes, never a diff/checkpoint alone. This
-theory proposes the Lean-domain instance of that same two-axis shape:
+Per qbp-architecture's **live-test reply at seq 5744 (2026-11-24)** — its reply to this
+seat's seq 5743 research post on inter#124, recorded in
+[[qbp-architecture-weight-space-ruling]] (not `issuecomment-7120111182`, which was this
+seat's own research post, not the ruling) — a candidate artifact is auditable only with
+an edit-plus-eval-record: base checkpoint sha, edit sha, and a two-axis gate
+(hallucination rate AND false-abstention rate on answerable questions, plus paraphrase
+robustness) run before and after — never a diff/checkpoint alone.
 
-| Axis | Weight-space-ruling analog | Lean-domain instance |
+**The first draft of this table dropped the axis the ruling actually guards against.**
+The ruling's second axis exists to catch BLADE's failure mode: an intervention that
+fixes one thing while quietly losing another. Paraphrase robustness alone doesn't catch
+that for Lean — the Lean analog of "quietly losing something" is **regression on
+statements the base model already solved**, which a refinement step can cause even
+while raising the headline pass rate.
+
+| Row | Weight-space-ruling analog | Lean-domain instance |
 |---|---|---|
-| 1 | Hallucination rate | Proof pass rate per statement (does it compile and close the goal) |
-| 2 | False-abstention / paraphrase robustness | Pass rate on a **restated/renamed** version of the same statement — does the model generalize the proof strategy, or pattern-match literal statement text? |
+| Axis 1 | Hallucination rate | Pass rate on a **frozen held-out statement set** — never in any training data (spec §1.1, fixes B3) |
+| Axis 2 | False-abstention rate | **Retention** — pass rate on the statements the *base* model already solved, re-checked after refinement; regression beyond a stated tolerance fails the gate |
+| + | Paraphrase robustness | Pass rate on a **restated/renamed** version of each axis-1 statement, each restatement accompanied by a kernel-checked equivalence proof that it didn't change the theorem (should-fix item from the §I4 review) |
 
-Both axes are measured by the same Lean kernel check; axis 2 only requires generating
-paraphrased statement variants (mechanical renaming + restructuring, not semantic
-rewriting that could change the theorem).
+All three rows use the §2.1 pass predicate, never a bare compile. Report base-sha /
+candidate-sha pass rates on the *same* frozen set, before and after, per spec §5.
 
 ## 7. Explicit non-claims and open risks
 
@@ -131,10 +191,18 @@ rewriting that could change the theorem).
   exactly what P1/P2 are for.
 - **Not claimed:** that this scales to problems outside narrow, already-solved-style
   Lean statements, or that it generalizes to other formal systems (Coq, Agda).
-- **Risk — sampling cost:** each rollout is a Lean compile; Dr. Zero's own paper names
-  nested sampling as its dominant cost and built a whole alternate algorithm (HRPO) to
-  cut it. Compile cost per attempt needs a measured estimate before any resourced run,
-  not an assumption.
+- **Blocker, not a measure-later item — verifier soundness (B1, fixed by §2.1):** a
+  raw compile is gameable (QBP#824/#829/#836). Addressed by the §2.1 pass predicate
+  (type fingerprint + axiom audit + sandboxed proof-body-only check); until QBP#836
+  resolves the build-time-execution gap, every check of untrusted candidate text runs
+  in a sandbox that cannot write the path an out-of-process auditor reads. This is a
+  present design requirement for spec §2/§3, not something to defer to P1 measurement.
+- **Risk — sampling cost:** each rollout is a Lean compile, and loading Mathlib's
+  `.olean`s costs well over 1GB of resident memory per Lean process — that alone caps
+  concurrency before the GPU is even involved. Dr. Zero's own paper names nested
+  sampling as its dominant cost and built a whole alternate algorithm (HRPO) to cut it.
+  Compile cost and memory-per-process need a measured estimate as explicit inputs to
+  @deming's resource estimate before any resourced run, not an assumption.
 - **Risk — problem-pool size:** unknown how many solved Lean statements currently exist
   across federation repos. A census (spec §1) should run before sizing the harness.
 - **Risk — sandbox visibility:** if any data-generation run reuses the `lean-prover`
